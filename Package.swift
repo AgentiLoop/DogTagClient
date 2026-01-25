@@ -14,7 +14,7 @@ let package = Package(
     ],
     dependencies: [
         // External dependency to DogTagStorage - ensure this repository exists and is accessible
-        .package(url: "https://github.com/webauthnai/DogTagStorage.git", from: "1.0.6")
+        .package(url: "https://github.com/SuperBox64/DogTagStorage.git", from: "1.0.6")
     ],
     targets: [
         .target(

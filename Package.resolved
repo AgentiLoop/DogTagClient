@@ -3,7 +3,7 @@
     {
       "identity" : "dogtagstorage",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/webauthnai/DogTagStorage.git",
+      "location" : "https://github.com/SuperBox64/DogTagStorage.git",
       "state" : {
         "revision" : "2b099081c6ad1f7f83749defed8381e304ed6c87",
         "version" : "1.0.6"
