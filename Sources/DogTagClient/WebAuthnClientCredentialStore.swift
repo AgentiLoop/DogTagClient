@@ -10,77 +10,156 @@ import CryptoKit
 
 final class WebAuthnClientCredentialStore: @unchecked Sendable {
     static let shared = WebAuthnClientCredentialStore()
-    
+
     private var storage: (any StorageManager)?
     private let customStorageConfig: StorageConfiguration?
-    
+    private let storageLock = NSLock()
+    private var isStorageInitialized = false
+
     private init() {
         self.customStorageConfig = nil
-        Task {
-            try await setupStorage()
-        }
+        // Block until storage is initialized to prevent race conditions
+        initializeStorageSync()
     }
-    
+
     // Initializer for virtual storage with custom database path
     init(customDatabasePath: String) {
         self.customStorageConfig = StorageConfiguration(
             databaseName: "WebAuthnClient", // SIMPLIFIED: One unified database name
             customDatabasePath: customDatabasePath
         )
-        Task {
-            try await setupStorage()
-        }
+        // Block until storage is initialized to prevent race conditions
+        initializeStorageSync()
         print("✅ UNIFIED WebAuthn credential store initialized: \(customDatabasePath)")
     }
-    
+
     // Legacy initializer for compatibility - now redirects to custom database path initializer
     init(container: Any) {
         // This is a stub for compatibility - the real configuration should use the custom database path initializer
         self.customStorageConfig = nil
-        Task {
-            try await setupStorage()
-        }
+        // Block until storage is initialized to prevent race conditions
+        initializeStorageSync()
         print("⚠️ WebAuthn credential store initialized with legacy container interface - use custom database path instead")
     }
-    
-    private func setupStorage() async throws {
-        if storage == nil {
-            if let customConfig = customStorageConfig {
-                storage = try await StorageFactory.createStorageManager(configuration: customConfig)
-                print("✅ UNIFIED WebAuthn credential store initialized with DogTagStorage at: \(customConfig.customDatabasePath ?? "default")")
-            } else {
-                // SIMPLIFIED: Use unified configuration for default storage
-                let config = StorageConfiguration(databaseName: "WebAuthnClient")
-                storage = try await StorageFactory.createStorageManager(configuration: config)
-                print("✅ UNIFIED WebAuthn credential store initialized with default DogTagStorage")
+
+    /// Synchronously initializes storage, blocking until complete
+    /// This ensures storage is ready before any operations are attempted
+    private func initializeStorageSync() {
+        let semaphore = DispatchSemaphore(value: 0)
+
+        // Run initialization on a background queue to avoid blocking main thread deadlocks
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else {
+                semaphore.signal()
+                return
             }
+
+            Task {
+                do {
+                    try await self.setupStorage()
+                } catch {
+                    print("❌ [WebAuthnClientCredentialStore] Failed to initialize storage: \(error)")
+                }
+                semaphore.signal()
+            }
+        }
+
+        // Wait with timeout to prevent indefinite hangs
+        let result = semaphore.wait(timeout: .now() + 10.0)
+        if result == .timedOut {
+            print("⚠️ [WebAuthnClientCredentialStore] Storage initialization timed out - will retry on first use")
+        }
+    }
+
+    private func setupStorage() async throws {
+        storageLock.lock()
+        defer { storageLock.unlock() }
+
+        guard !isStorageInitialized else { return }
+
+        if let customConfig = customStorageConfig {
+            storage = try await StorageFactory.createStorageManager(configuration: customConfig)
+            print("✅ UNIFIED WebAuthn credential store initialized with DogTagStorage at: \(customConfig.customDatabasePath ?? "default")")
+        } else {
+            // SIMPLIFIED: Use unified configuration for default storage
+            let config = StorageConfiguration(databaseName: "WebAuthnClient")
+            storage = try await StorageFactory.createStorageManager(configuration: config)
+            print("✅ UNIFIED WebAuthn credential store initialized with default DogTagStorage")
+        }
+        isStorageInitialized = true
+    }
+
+    /// Ensures storage is ready, with retry logic
+    internal func ensureStorage() async throws -> any StorageManager {
+        if let existingStorage = storage, isStorageInitialized {
+            return existingStorage
+        }
+
+        try await setupStorage()
+
+        guard let storage = storage else {
+            throw NSError(domain: "WebAuthnClientCredentialStore", code: -1,
+                         userInfo: [NSLocalizedDescriptionKey: "Storage initialization failed"])
+        }
+        return storage
+    }
+
+    /// Safely executes an async operation and returns the result synchronously
+    /// Uses a background queue to avoid main thread deadlocks
+    private func runAsyncSync<T>(_ operation: @escaping () async -> T) -> T {
+        // If we're already on a background thread, we can use a simpler approach
+        if Thread.isMainThread {
+            // When on main thread, dispatch to background to avoid deadlock
+            var result: T!
+            let semaphore = DispatchSemaphore(value: 0)
+
+            DispatchQueue.global(qos: .userInitiated).async {
+                Task {
+                    result = await operation()
+                    semaphore.signal()
+                }
+            }
+
+            let waitResult = semaphore.wait(timeout: .now() + 30.0)
+            if waitResult == .timedOut {
+                print("⚠️ [WebAuthnClientCredentialStore] Operation timed out")
+            }
+            return result
+        } else {
+            // On background thread, we can block directly
+            var result: T!
+            let semaphore = DispatchSemaphore(value: 0)
+
+            Task {
+                result = await operation()
+                semaphore.signal()
+            }
+
+            semaphore.wait()
+            return result
         }
     }
     
     // MARK: - Public Interface
-    
+
     func storeCredential(_ credential: LocalCredential, privateKey: P256.Signing.PrivateKey) -> Bool {
         print("🔧 [WebAuthnClientCredentialStore] Starting credential storage...")
         print("🔧 [WebAuthnClientCredentialStore] Credential ID: \(credential.id)")
         print("🔧 [WebAuthnClientCredentialStore] RP ID: \(credential.rpId)")
         print("🔧 [WebAuthnClientCredentialStore] User: \(credential.userName)")
-        
-        let task = Task {
+
+        return runAsyncSync { [self] in
             do {
-                try await setupStorage()
-                guard let storage = storage else {
-                    print("❌ [WebAuthnClientCredentialStore] Storage not available")
-                    return false
-                }
-                
+                let storage = try await ensureStorage()
+
                 print("✅ [WebAuthnClientCredentialStore] Storage available")
-                
+
                 // Encrypt the private key for storage
                 print("🔧 [WebAuthnClientCredentialStore] Encrypting private key...")
                 let privateKeyData = privateKey.rawRepresentation
                 let encryptedPrivateKey = try encryptPrivateKey(privateKeyData, for: credential.id)
                 print("✅ [WebAuthnClientCredentialStore] Private key encrypted successfully")
-                
+
                 let credentialData = CredentialData(
                     id: credential.id,
                     rpId: credential.rpId,
@@ -94,33 +173,21 @@ final class WebAuthnClientCredentialStore: @unchecked Sendable {
                     userDisplayName: credential.userDisplayName,
                     credentialType: "public-key"
                 )
-                
+
                 print("🔧 [WebAuthnClientCredentialStore] Created DogTagStorage credential")
                 print("🔧 [WebAuthnClientCredentialStore] Saving to storage...")
-                
+
                 try await storage.saveCredential(credentialData)
                 print("✅ [WebAuthnClientCredentialStore] Saved successfully")
-                
+
                 print("✅ Stored credential in DogTagStorage: ID=\(credential.id), User=\(credential.userName)")
                 return true
-                
+
             } catch {
                 print("❌ [WebAuthnClientCredentialStore] Failed to store credential: \(error)")
                 return false
             }
         }
-        
-        // Use RunLoop to wait for async task completion
-        var result = false
-        let semaphore = DispatchSemaphore(value: 0)
-        
-        Task {
-            result = await task.value
-            semaphore.signal()
-        }
-        
-        semaphore.wait()
-        return result
     }
     
     // Store credential with already-encrypted private key data (for virtual key export)
@@ -129,15 +196,11 @@ final class WebAuthnClientCredentialStore: @unchecked Sendable {
         print("🔧 [WebAuthnClientCredentialStore] Credential ID: \(credential.id)")
         print("🔧 [WebAuthnClientCredentialStore] RP ID: \(credential.rpId)")
         print("🔧 [WebAuthnClientCredentialStore] User: \(credential.userName)")
-        
-        let task = Task {
+
+        return runAsyncSync { [self] in
             do {
-                try await setupStorage()
-                guard let storage = storage else {
-                    print("❌ [WebAuthnClientCredentialStore] Storage not available")
-                    return false
-                }
-                
+                let storage = try await ensureStorage()
+
                 let credentialData = CredentialData(
                     id: credential.id,
                     rpId: credential.rpId,
@@ -151,42 +214,26 @@ final class WebAuthnClientCredentialStore: @unchecked Sendable {
                     userDisplayName: credential.userDisplayName,
                     credentialType: "public-key"
                 )
-                
+
                 try await storage.saveCredential(credentialData)
-                
+
                 print("✅ Stored credential with encrypted key in DogTagStorage: ID=\(credential.id), User=\(credential.userName)")
                 return true
-                
+
             } catch {
                 print("❌ [WebAuthnClientCredentialStore] Failed to store credential: \(error)")
                 return false
             }
         }
-        
-        // Use RunLoop to wait for async task completion
-        var result = false
-        let semaphore = DispatchSemaphore(value: 0)
-        
-        Task {
-            result = await task.value
-            semaphore.signal()
-        }
-        
-        semaphore.wait()
-        return result
     }
     
     func getCredentials(for rpId: String) -> [LocalCredential] {
-        let task = Task {
+        return runAsyncSync { [self] in
             do {
-                try await setupStorage()
-                guard let storage = storage else {
-                    print("❌ Storage not available")
-                    return [LocalCredential]()
-                }
-                
+                let storage = try await ensureStorage()
+
                 let credentials = try await storage.fetchCredentials(for: rpId)
-                
+
                 let localCredentials = credentials.compactMap { credData -> LocalCredential? in
                     return LocalCredential(
                         id: credData.id,
@@ -198,42 +245,26 @@ final class WebAuthnClientCredentialStore: @unchecked Sendable {
                         createdAt: credData.createdAt
                     )
                 }
-                
+
                 print("🔍 Found \(localCredentials.count) credentials for RP: \(rpId)")
                 return localCredentials.sorted { $0.createdAt > $1.createdAt }
-                
+
             } catch {
                 print("❌ Failed to fetch credentials: \(error)")
                 return [LocalCredential]()
             }
         }
-        
-        // Use RunLoop to wait for async task completion
-        var result = [LocalCredential]()
-        let semaphore = DispatchSemaphore(value: 0)
-        
-        Task {
-            result = await task.value
-            semaphore.signal()
-        }
-        
-        semaphore.wait()
-        return result
     }
     
     func getAllCredentials() -> [LocalCredential] {
-        let task = Task {
+        return runAsyncSync { [self] in
             do {
-                try await setupStorage()
-                guard let storage = storage else {
-                    print("❌ Storage not available")
-                    return [LocalCredential]()
-                }
-                
+                let storage = try await ensureStorage()
+
                 let credentials = try await storage.fetchCredentials()
-                
+
                 print("🔍 DogTagStorage fetch: Found \(credentials.count) raw credentials")
-                
+
                 let localCredentials = credentials.compactMap { credData -> LocalCredential? in
                     print("🔍 Processing credential: ID=\(credData.id), RP=\(credData.rpId), User=\(credData.userDisplayName ?? "Unknown")")
                     return LocalCredential(
@@ -246,103 +277,71 @@ final class WebAuthnClientCredentialStore: @unchecked Sendable {
                         createdAt: credData.createdAt
                     )
                 }
-                
+
                 print("🔍 DogTagStorage converted: \(localCredentials.count) local credentials")
                 return localCredentials.sorted { $0.createdAt > $1.createdAt }
-                
+
             } catch {
                 print("❌ Failed to fetch all credentials: \(error)")
                 return [LocalCredential]()
             }
         }
-        
-        // Use RunLoop to wait for async task completion
-        var result = [LocalCredential]()
-        let semaphore = DispatchSemaphore(value: 0)
-        
-        Task {
-            result = await task.value
-            semaphore.signal()
-        }
-        
-        semaphore.wait()
-        return result
     }
     
     func getPrivateKey(for credentialId: String) -> P256.Signing.PrivateKey? {
-        let task = Task {
+        return runAsyncSync { [self] in
             do {
-                try await setupStorage()
-                guard let storage = storage else {
-                    print("❌ Storage not available for getPrivateKey")
-                    return nil as P256.Signing.PrivateKey?
-                }
-                
+                let storage = try await ensureStorage()
+
                 print("🔍 Getting private key for credential: \(credentialId)")
-                
+
                 let credentials = try await storage.fetchCredentials()
-                
+
                 guard let credData = credentials.first(where: { $0.id == credentialId }) else {
                     print("❌ No credential found for ID: \(credentialId)")
                     return nil as P256.Signing.PrivateKey?
                 }
-                
+
                 print("🔍 Found credential, extracting private key...")
-                
+
                 guard let privateKeyRef = credData.privateKeyRef,
                       let encryptedData = Data(base64Encoded: privateKeyRef) else {
                     print("❌ No private key data found")
                     return nil as P256.Signing.PrivateKey?
                 }
-                
+
                 print("🔍 Encrypted private key size: \(encryptedData.count) bytes")
-                
+
                 // Decrypt the private key
                 let decryptedPrivateKey = try decryptPrivateKey(encryptedData, for: credentialId)
                 print("🔍 Decrypted private key size: \(decryptedPrivateKey.count) bytes")
-                
+
                 let privateKey = try P256.Signing.PrivateKey(rawRepresentation: decryptedPrivateKey)
                 print("✅ Successfully reconstructed private key")
                 return privateKey
-                
+
             } catch {
                 print("❌ Failed to retrieve private key: \(error)")
                 return nil as P256.Signing.PrivateKey?
             }
         }
-        
-        // Use RunLoop to wait for async task completion
-        var result: P256.Signing.PrivateKey? = nil
-        let semaphore = DispatchSemaphore(value: 0)
-        
-        Task {
-            result = await task.value
-            semaphore.signal()
-        }
-        
-        semaphore.wait()
-        return result
     }
     
     func updateSignCount(for credentialId: String, newCount: UInt32) -> Bool {
-        let task = Task<Bool, Never> {
+        return runAsyncSync { [self] in
             do {
-                try await setupStorage()
-                guard let storage = storage else {
-                    print("❌ Storage not available")
-                    return false
-                }
-                
+                let storage = try await ensureStorage()
+
                 let credentials = try await storage.fetchCredentials()
-                
+
                 guard let credData = credentials.first(where: { $0.id == credentialId }) else {
                     print("❌ No credential found for ID: \(credentialId)")
                     return false
                 }
-                
+
                 let oldCount = credData.signCount
                 let countChanged = oldCount != newCount
-                
+
                 // Update the credential with new sign count and last used time
                 let updatedCred = CredentialData(
                     id: credData.id,
@@ -357,51 +356,35 @@ final class WebAuthnClientCredentialStore: @unchecked Sendable {
                     userDisplayName: credData.userDisplayName,
                     credentialType: credData.credentialType
                 )
-                
+
                 try await storage.saveCredential(updatedCred)
-                
+
                 if countChanged && newCount > oldCount {
                     print("✅ Updated sign count from \(oldCount) to \(newCount)")
                 }
                 print("✅ Updated last used timestamp")
-                
+
                 return true
-                
+
             } catch {
                 print("❌ Failed to update sign count: \(error)")
                 return false
             }
         }
-        
-        // Use RunLoop to wait for async task completion
-        var result = false
-        let semaphore = DispatchSemaphore(value: 0)
-        
-        Task {
-            result = await task.value
-            semaphore.signal()
-        }
-        
-        semaphore.wait()
-        return result
     }
     
     func updateDisplayName(for credentialId: String, newDisplayName: String) -> Bool {
-        let task = Task {
+        return runAsyncSync { [self] in
             do {
-                try await setupStorage()
-                guard let storage = storage else {
-                    print("❌ Storage not available")
-                    return false
-                }
-                
+                let storage = try await ensureStorage()
+
                 let credentials = try await storage.fetchCredentials()
-                
+
                 guard let credData = credentials.first(where: { $0.id == credentialId }) else {
                     print("❌ No credential found for ID: \(credentialId)")
                     return false
                 }
-                
+
                 // Update the credential with new display name
                 let updatedCred = CredentialData(
                     id: credData.id,
@@ -416,132 +399,72 @@ final class WebAuthnClientCredentialStore: @unchecked Sendable {
                     userDisplayName: newDisplayName,
                     credentialType: credData.credentialType
                 )
-                
+
                 try await storage.saveCredential(updatedCred)
-                
+
                 print("✅ Updated display name for credential \(credentialId): \(newDisplayName)")
                 return true
-                
+
             } catch {
                 print("❌ Failed to update display name: \(error)")
                 return false
             }
         }
-        
-        // Use RunLoop to wait for async task completion
-        var result = false
-        let semaphore = DispatchSemaphore(value: 0)
-        
-        Task {
-            result = await task.value
-            semaphore.signal()
-        }
-        
-        semaphore.wait()
-        return result
     }
     
     func getSignCount(for credentialId: String) -> UInt32? {
-        let task = Task {
+        return runAsyncSync { [self] in
             do {
-                try await setupStorage()
-                guard let storage = storage else {
-                    print("❌ Storage not available")
-                    return nil as UInt32?
-                }
-                
+                let storage = try await ensureStorage()
+
                 let credentials = try await storage.fetchCredentials()
-                
+
                 guard let credData = credentials.first(where: { $0.id == credentialId }) else {
                     print("❌ No credential found for ID: \(credentialId)")
                     return nil as UInt32?
                 }
-                
+
                 return UInt32(credData.signCount)
-                
+
             } catch {
                 print("❌ Failed to get sign count: \(error)")
                 return nil as UInt32?
             }
         }
-        
-        // Use RunLoop to wait for async task completion
-        var result: UInt32? = nil
-        let semaphore = DispatchSemaphore(value: 0)
-        
-        Task {
-            result = await task.value
-            semaphore.signal()
-        }
-        
-        semaphore.wait()
-        return result
     }
     
     // Get raw credential data for export (includes private keys)
     func getRawCredentialData() -> [CredentialData] {
-        let task = Task {
+        return runAsyncSync { [self] in
             do {
-                try await setupStorage()
-                guard let storage = storage else {
-                    print("❌ Storage not available")
-                    return [CredentialData]()
-                }
-                
+                let storage = try await ensureStorage()
+
                 let credentials = try await storage.fetchCredentials()
                 print("🔍 Retrieved \(credentials.count) raw credentials for export")
                 return credentials
-                
+
             } catch {
                 print("❌ Failed to fetch raw credential data: \(error)")
                 return [CredentialData]()
             }
         }
-        
-        // Use RunLoop to wait for async task completion
-        var result = [CredentialData]()
-        let semaphore = DispatchSemaphore(value: 0)
-        
-        Task {
-            result = await task.value
-            semaphore.signal()
-        }
-        
-        semaphore.wait()
-        return result
     }
     
     func deleteCredential(credentialId: String) -> Bool {
-        let task = Task {
+        return runAsyncSync { [self] in
             do {
-                try await setupStorage()
-                guard let storage = storage else {
-                    print("❌ Storage not available")
-                    return false
-                }
-                
+                let storage = try await ensureStorage()
+
                 try await storage.deleteCredential(id: credentialId)
-                
+
                 print("✅ Deleted credential: \(credentialId)")
                 return true
-                
+
             } catch {
                 print("❌ Failed to delete credential: \(error)")
                 return false
             }
         }
-        
-        // Use RunLoop to wait for async task completion
-        var result = false
-        let semaphore = DispatchSemaphore(value: 0)
-        
-        Task {
-            result = await task.value
-            semaphore.signal()
-        }
-        
-        semaphore.wait()
-        return result
     }
     
     /// Store a credential from a virtual key to local storage
@@ -550,21 +473,18 @@ final class WebAuthnClientCredentialStore: @unchecked Sendable {
         do {
             // When storing from virtual key, we need to get the raw credential data
             // that includes the private key from the current virtual key storage
-            if let currentStorage = storage {
-                let rawCredentials = try await currentStorage.fetchCredentials()
-                if let rawCred = rawCredentials.first(where: { $0.id == credential.id }) {
-                    // Store the credential with its private key in local storage
-                    let localStore = WebAuthnClientCredentialStore.shared
-                    try await localStore.setupStorage()
-                    if let localStorage = localStore.storage {
-                        try await localStorage.saveCredential(rawCred)
-                        return true
-                    }
-                }
+            let currentStorage = try await ensureStorage()
+            let rawCredentials = try await currentStorage.fetchCredentials()
+            if let rawCred = rawCredentials.first(where: { $0.id == credential.id }) {
+                // Store the credential with its private key in local storage
+                let localStore = WebAuthnClientCredentialStore.shared
+                let localStorage = try await localStore.ensureStorage()
+                try await localStorage.saveCredential(rawCred)
+                return true
             }
             return false
         } catch {
-            print("❌ Failed to transfer credential from virtual key: \\(error)")
+            print("❌ Failed to transfer credential from virtual key: \(error)")
             return false
         }
     }

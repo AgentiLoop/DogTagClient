@@ -7,13 +7,49 @@ import DogTagStorage
 
 public class VirtualKeyStorageManager: ObservableObject {
     public static let shared = VirtualKeyStorageManager()
-    
+
     @Published public var currentStorageMode: StorageMode = .local
     @Published public var activeVirtualKey: VirtualHardwareKey?
-    
+
     private var virtualKeyMountPoint: URL?
-    
+
     private init() {}
+
+    /// Safely executes an async operation and returns the result synchronously
+    /// Uses a background queue to avoid main thread deadlocks
+    private func runAsyncSync<T>(_ operation: @escaping () async -> T) -> T {
+        // If we're already on a background thread, we can use a simpler approach
+        if Thread.isMainThread {
+            // When on main thread, dispatch to background to avoid deadlock
+            var result: T!
+            let semaphore = DispatchSemaphore(value: 0)
+
+            DispatchQueue.global(qos: .userInitiated).async {
+                Task {
+                    result = await operation()
+                    semaphore.signal()
+                }
+            }
+
+            let waitResult = semaphore.wait(timeout: .now() + 30.0)
+            if waitResult == .timedOut {
+                print("⚠️ [VirtualKeyStorageManager] Operation timed out")
+            }
+            return result
+        } else {
+            // On background thread, we can block directly
+            var result: T!
+            let semaphore = DispatchSemaphore(value: 0)
+
+            Task {
+                result = await operation()
+                semaphore.signal()
+            }
+
+            semaphore.wait()
+            return result
+        }
+    }
     
     public enum StorageMode: Equatable {
         case local
@@ -226,22 +262,21 @@ public class VirtualKeyStorageManager: ObservableObject {
             print("❌ No virtual key mounted")
             return []
         }
-        
+
         // FIXED: Use the SAME unified database that export/analysis use
         let unifiedDbPath = mountPoint.appendingPathComponent("WebAuthnClient.db")
-        
-        // Use synchronous wrapper for the async DogTagStorage call
-        let task = Task {
+
+        return runAsyncSync {
             do {
                 let config = StorageConfiguration(
                     databaseName: "WebAuthnClient", // SAME AS EXPORT
                     customDatabasePath: unifiedDbPath.path
                 )
                 let virtualKeyStorage = try await StorageFactory.createStorageManager(configuration: config)
-                
+
                 // Fetch credentials from virtual key's UNIFIED database
                 let credentials = try await virtualKeyStorage.fetchCredentials()
-                
+
                 return credentials.map { credData in
                     LocalCredential(
                         id: credData.id,
@@ -249,7 +284,7 @@ public class VirtualKeyStorageManager: ObservableObject {
                         userName: credData.userDisplayName ?? "Unknown",
                         userDisplayName: credData.userDisplayName ?? "Unknown",
                         userId: String(data: credData.userHandle, encoding: .utf8) ?? credData.id,
-                        publicKey: credData.publicKey, // ✅ PUBLIC KEY preserved
+                        publicKey: credData.publicKey, // PUBLIC KEY preserved
                         createdAt: credData.createdAt
                     )
                 }
@@ -258,18 +293,6 @@ public class VirtualKeyStorageManager: ObservableObject {
                 return [LocalCredential]()
             }
         }
-        
-        // Use RunLoop to wait for async task completion
-        var result = [LocalCredential]()
-        let semaphore = DispatchSemaphore(value: 0)
-        
-        Task {
-            result = await task.value
-            semaphore.signal()
-        }
-        
-        semaphore.wait()
-        return result
     }
     
     private func getVirtualServerCredentials() -> [WebAuthnCredential] {
@@ -277,22 +300,21 @@ public class VirtualKeyStorageManager: ObservableObject {
             print("❌ No virtual key mounted")
             return []
         }
-        
+
         // FIXED: Use the SAME unified database that export/analysis use
         let unifiedDbPath = mountPoint.appendingPathComponent("WebAuthnClient.db")
-        
-        // Use synchronous wrapper for the async DogTagStorage call
-        let task = Task {
+
+        return runAsyncSync {
             do {
                 let config = StorageConfiguration(
                     databaseName: "WebAuthnClient", // SAME AS EXPORT
                     customDatabasePath: unifiedDbPath.path
                 )
                 let virtualKeyStorage = try await StorageFactory.createStorageManager(configuration: config)
-                
+
                 // Fetch server credentials from virtual key's UNIFIED database
                 let credentials = try await virtualKeyStorage.fetchServerCredentials()
-                
+
                 return credentials.map { serverData in
                     WebAuthnCredential(
                         id: serverData.id,
@@ -320,18 +342,6 @@ public class VirtualKeyStorageManager: ObservableObject {
                 return [WebAuthnCredential]()
             }
         }
-        
-        // Use RunLoop to wait for async task completion
-        var result = [WebAuthnCredential]()
-        let semaphore = DispatchSemaphore(value: 0)
-        
-        Task {
-            result = await task.value
-            semaphore.signal()
-        }
-        
-        semaphore.wait()
-        return result
     }
     
     // MARK: - Storage Information
