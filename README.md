@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**A powerful Swift package for WebAuthn/FIDO2 credential management on macOS**
+**A powerful Swift package for WebAuthn/FIDO2 Credential Management on macOS**
 
 [![Swift 5.9+](https://img.shields.io/badge/Swift-5.9+-orange.svg)](https://swift.org)
 [![macOS 12+](https://img.shields.io/badge/macOS-12+-blue.svg)](https://developer.apple.com/macos/)
