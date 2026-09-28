@@ -503,3 +503,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 [Report Issues](https://github.com/yourusername/DogTagClient/issues) • [Feature Requests](https://github.com/yourusername/DogTagClient/discussions) • [Documentation](https://github.com/yourusername/DogTagClient/wiki)
 
 </div> 
+
+---
+
+**AgentiLoop:** [agentiloop.ai](https://agentiloop.ai/)
+
+Copyright © 2026 AgentiLoop.ai, a Logos InkPen LLC company. All rights reserved.
